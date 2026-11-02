@@ -33,6 +33,9 @@ curl -fsSL https://raw.githubusercontent.com/cevtuocjw/blendergate/main/install.
 curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/cevtuocjw/blendergate/main/install.sh | sh
 ```
 
+安装脚本会按 **官方 → ghproxy.net → gh-proxy.com → ghfast.top** 的顺序自动重试，
+前一跳失败就换下一个，不会停在中途。
+
 也可以手动下载：
 
 ```bash
