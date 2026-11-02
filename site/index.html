@@ -162,7 +162,9 @@
   @media (max-width:660px){
     .wrap{padding:28px 14px 0}
     .hero{padding:34px 20px 28px}
-    .cmd code{white-space:normal;word-break:break-all}
+    .cmd{flex-wrap:wrap}
+    .cmd code{flex:1 1 calc(100% - 34px);white-space:normal;word-break:break-all}
+    .cmd button{margin-left:auto}
     .dl .btn{min-width:100%}
     .why,.install{padding-left:20px;padding-right:20px}
   }
