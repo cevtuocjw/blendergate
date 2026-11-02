@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/cevtuocjw/blendergate/main/install.
 国内网络可以用镜像：
 
 ```bash
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/cevtuocjw/blendergate/main/install.sh | sh
+curl -fsSL https://ghproxy.net/https://github.com/cevtuocjw/blendergate/releases/latest/download/install.sh | sh
 ```
 
 安装脚本会按 **官方 → ghproxy.net → gh-proxy.com → ghfast.top** 的顺序自动重试，
