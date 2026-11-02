@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """blq —— 全机 Blender 串行闸门（Cevtuo-Blendergate）。
 
-为什么要这个：多个窗口各自 `blender -b ...`，每件开满线程抢同一批核，
-load 冲到 300、swap 吃满，单件从 30s 变 10min，还互相覆盖同名的 GLB。
-并发本身不赚钱，只会互相拖慢。
+为什么要这个：多个窗口各自 `blender -b ...` 的时候，同时跑几件、谁先跑
+全凭运气，产出文件还可能互相覆盖。`blq` 把并发变成一个可控的数字。
 
 规矩只有一条：**headless 渲染一律 `blq render xxx.py -- args`，不要直接调 Blender 二进制。**
-`blq` 保证全机同时最多 N 件（默认 2）在跑，其余排队；谁先来谁先跑。
+`blq` 默认按整机 CPU 压力动态决定并发（从 1 到上限，默认上限是核数的一半），
+其余排队；谁先来谁先跑。也可以用 `BLQ_SLOTS` / `--slots` 固定成某个数。
 
 用法（装好后直接 `blq ...`；在本仓库里等价于 `python3 scripts/blq.py ...`）：
     blq render scripts/g33-shaker-glass.py             # -b --factory-startup -P 已内置
@@ -44,7 +44,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def _find_blender() -> str:
@@ -75,9 +75,18 @@ SLOT_DIR = STATE / "slots"
 JOB_DIR = STATE / "jobs"
 WAIT_DIR = STATE / "waiting"
 LOG_DIR = STATE / "logs"
-# 10 核机器上 2 件并行大致能把核喂满，再往上就只是互相抢。
-DEFAULT_SLOTS = int(os.environ.get("BLQ_SLOTS", "2"))
+# 并发：默认动态（按实时 CPU 压力决定），也可以用 BLQ_SLOTS / --slots 固定。
+CORES = os.cpu_count() or 1
+FIXED_SLOTS = int(os.environ["BLQ_SLOTS"]) if os.environ.get("BLQ_SLOTS") else None
+MAX_SLOTS = int(os.environ.get("BLQ_MAX_SLOTS", str(max(2, min(8, CORES // 2)))))
+MIN_SLOTS = int(os.environ.get("BLQ_MIN_SLOTS", "1"))
+CPU_TARGET = float(os.environ.get("BLQ_CPU_TARGET", "0.85"))
+ADMIT_GAP = float(os.environ.get("BLQ_ADMIT_GAP", "3"))
+MAX_SWAP_GB = float(os.environ.get("BLQ_MAX_SWAP_GB", "4.5"))
+MIN_FREE_MB = int(os.environ.get("BLQ_MIN_FREE_MB", "1024"))
 PAGE = STATE / "status.html"
+MONITOR = STATE / "monitor.json"
+ADMIT_STAMP = STATE / "last-admit"
 STATUS_PORT = int(os.environ.get("BLQ_PORT", "8132"))
 # 没有浏览器在看时，状态页服务最多再活这么久就自己退出（0 = 永不退出）。
 SERVE_IDLE = int(os.environ.get("BLQ_SERVE_IDLE", "300"))
@@ -179,11 +188,191 @@ def find_duplicate(tag: str) -> str | None:
     return None
 
 
-def acquire_slot(label: str, slots: int, wait: bool, tag: str = "") -> tuple[int, int] | None:
+def _scan_slots(limit: int) -> tuple[int, list[tuple[int, int]]]:
+    """数一下已经占了几个槽位，顺手把空闲槽位的锁 fd 拿在手里。"""
+    busy, free = 0, []
+    for i in range(1, limit + 1):
+        fd = os.open(SLOT_DIR / f"slot-{i}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            free.append((i, fd))
+        except OSError:
+            os.close(fd)
+            busy += 1
+    return busy, free
+
+
+_CPU_CACHE: dict[str, float | None] = {"t": 0.0, "v": None}
+
+
+def _proc_stat() -> tuple[int, int]:
+    with open("/proc/stat") as f:
+        vals = [int(x) for x in f.readline().split()[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return idle, sum(vals)
+
+
+def _sample_cpu() -> float | None:
+    """当前整机 CPU 占用比例（0~1）。取不到就返回 None。"""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["top", "-l", "1", "-n", "0", "-s", "0"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            m = re.search(r"CPU usage:.*?([\d.]+)%\s*idle", out)
+            return 1.0 - float(m.group(1)) / 100 if m else None
+        if sys.platform.startswith("linux"):
+            a = _proc_stat()
+            time.sleep(0.2)
+            b = _proc_stat()
+            di, dt = b[0] - a[0], b[1] - a[1]
+            return 1.0 - di / dt if dt > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def cpu_busy() -> float | None:
+    """给手动命令用的一次性采样（进程内缓存 2 秒）。"""
+    now = time.time()
+    if now - _CPU_CACHE["t"] < 2.0:
+        return _CPU_CACHE["v"]
+    _CPU_CACHE["t"] = now
+    _CPU_CACHE["v"] = _sample_cpu()
+    return _CPU_CACHE["v"]
+
+
+def memory_state() -> tuple[bool, str]:
+    """返回 (是否还有余量, 一句人能看懂的说明)。"""
+    try:
+        if sys.platform == "darwin":
+            s = subprocess.run(
+                ["sysctl", "-n", "vm.swapusage"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            m = re.search(r"used = ([\d.]+)M", s)
+            if m:
+                used = float(m.group(1)) / 1024
+                return used <= MAX_SWAP_GB, f"swap {used:.1f}G/{MAX_SWAP_GB:.1f}G"
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as f:
+                info = {
+                    line.split(":")[0]: int(line.split()[1])
+                    for line in f if ":" in line
+                }
+            avail = info.get("MemAvailable", 0) / 1024
+            return avail >= MIN_FREE_MB, f"可用 {avail:.0f}M"
+    except Exception:
+        pass
+    return True, "内存状态未知"
+
+
+def _read_monitor() -> dict:
+    try:
+        return json.loads(MONITOR.read_text())
+    except Exception:
+        return {}
+
+
+def _write_monitor(
+    busy: int,
+    limit: int,
+    cpu: float | None,
+    cpu_ts: float,
+    swap: str,
+    allow: bool,
+    resample: bool = False,
+) -> None:
+    try:
+        MONITOR.write_text(
+            json.dumps(
+                {
+                    "ts": time.time(),
+                    "busy": busy,
+                    "limit": limit,
+                    "cpu": cpu,
+                    "cpu_ts": cpu_ts,
+                    "swap": swap,
+                    "allow": allow,
+                    "resample": resample,
+                }
+            )
+        )
+    except OSError:
+        pass
+
+
+def _last_admit() -> float:
+    try:
+        return ADMIT_STAMP.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _admit(fixed: int | None) -> tuple[int, int] | None:
+    """在 admission 锁里决定「现在能不能再进一件」。
+
+    动态模式：第一件永远放行；之后要求整机 CPU 低于目标、swap 还有余量，
+    并且距离上一次放行至少 ADMIT_GAP 秒 —— 给刚起的作业一点时间把 CPU 吃上去，
+    否则会在采样到之前一口气放进来一堆。
+    """
+    limit = fixed if fixed is not None else MAX_SLOTS
+    guard = os.open(STATE / "admit.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        busy, free = _scan_slots(limit)
+        now = time.time()
+        mon = _read_monitor() if fixed is None else {}
+        cpu: float | None = mon.get("cpu")
+        cpu_ts: float = mon.get("cpu_ts", 0.0)
+        resample = bool(mon.get("resample"))
+        mem_txt = ""
+        if fixed is not None:
+            allow = busy < fixed
+            resample = False
+        elif busy < MIN_SLOTS:
+            allow = True
+        else:
+            mem_ok, mem_txt = memory_state()
+            gap_ok = now - _last_admit() >= ADMIT_GAP
+            if busy < MAX_SLOTS and gap_ok:
+                # 所有等待者共享同一个采样，最多每 8 秒跑一次 top；
+                # 刚放行过（resample）就强制重新采样，别拿放行前的数字连着放。
+                if cpu is None or now - cpu_ts > 8 or resample:
+                    cpu = _sample_cpu()
+                    cpu_ts = now if cpu is not None else 0.0
+                    resample = False
+                allow = mem_ok and (cpu is None or cpu < CPU_TARGET)
+            else:
+                allow = False
+        if allow and free:
+            slot_no, slot_fd = free.pop(0)
+            for _, fd in free:
+                os.close(fd)
+            if fixed is None:
+                ADMIT_STAMP.touch()
+                resample = True
+            # 刚放行：下一次判断强制重新采样，别拿旧数字连着放
+            _write_monitor(busy + 1, limit, cpu, cpu_ts, mem_txt, True, resample)
+            # 锁住 fd 必须活到子进程结束，这里直接返回 fd 由调用方持有。
+            return slot_fd, slot_no
+        _write_monitor(busy, limit, cpu, cpu_ts, mem_txt, allow)
+        for _, fd in free:
+            os.close(fd)
+        return None
+    finally:
+        os.close(guard)
+
+
+def acquire_slot(
+    label: str, slots: int | None, wait: bool, tag: str = ""
+) -> tuple[int, int] | None:
     """拿一个槽位。返回 (fd, 槽位号)；wait=False 且无空位时返回 None。
 
     先登记票据再抢槽位，抢到前检查「有没有比我更早的票据还在等」——
-    否则 9 个窗口一起 poll，后到的可能一直抢赢先到的（饥饿）。
+    否则多个窗口一起 poll，后到的可能一直抢赢先到的（饥饿）。
+    slots=None 走动态并发。
     """
     ensure_dirs()
     ticket_seq = next_seq()
@@ -207,26 +396,21 @@ def acquire_slot(label: str, slots: int, wait: bool, tag: str = "") -> tuple[int
             if first != ticket_seq:
                 if not wait:
                     return None
-                time.sleep(0.5)
+                time.sleep(1.0)
                 continue
-            for i in range(1, slots + 1):
-                lock_path = SLOT_DIR / f"slot-{i}.lock"
-                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
-                    os.close(fd)
-                    continue
-                # 锁住 fd 必须活到子进程结束，这里直接返回 fd 由调用方持有。
-                return fd, i
+            got = _admit(slots)
+            if got:
+                return got
             if not wait:
                 return None
-            time.sleep(0.5)
+            time.sleep(1.0)
     finally:
         ticket_path.unlink(missing_ok=True)
 
 
-def cmd_run(argv: list[str], slots: int, label: str | None, tag: str, force: bool = False) -> int:
+def cmd_run(
+    argv: list[str], slots: int | None, label: str | None, tag: str, force: bool = False
+) -> int:
     if not argv:
         print("blq run: 后面要跟命令行（用 -- 分隔）", file=sys.stderr)
         return 2
@@ -244,7 +428,8 @@ def cmd_run(argv: list[str], slots: int, label: str | None, tag: str, force: boo
     url = ensure_status_server()
     if url:
         print(f"[blq {now()}] 状态页：{url}  （随时重开：blq open）", flush=True)
-    print(f"[blq {now()}] 排队中：{label}（并发上限 {slots}）", flush=True)
+    mode = f"并发上限 {slots}" if slots is not None else f"动态并发，上限 {MAX_SLOTS}"
+    print(f"[blq {now()}] 排队中：{label}（{mode}）", flush=True)
     t0 = time.time()
     got = acquire_slot(label, slots, wait=True, tag=tag)
     assert got
@@ -352,9 +537,16 @@ def _collect() -> dict:
     jobs = read_jobs()
     waiting = waiting_tickets()
     procs = blender_procs()
+    mon = _read_monitor()
+    cpu = mon.get("cpu")
+    cpu_ts = mon.get("cpu_ts", 0.0)
     data = {
         "generated": datetime.now().isoformat(timespec="seconds"),
-        "slots": DEFAULT_SLOTS,
+        "mode": "fixed" if FIXED_SLOTS is not None else "dynamic",
+        "slots": FIXED_SLOTS if FIXED_SLOTS is not None else MAX_SLOTS,
+        "max_slots": MAX_SLOTS,
+        "cpu": round(cpu * 100) if cpu is not None and time.time() - cpu_ts < 30 else None,
+        "swap": mon.get("swap") or "",
         "running": [
             {
                 "label": j["label"],
@@ -409,6 +601,10 @@ def cmd_status(as_json: bool = False) -> int:
         for s in data["strays"]:
             print(f"  ! pid {s['pid']:<7} {s['pcpu']:>6.1f}%  {s['etime']:>8}  {s['cmd']}")
         print("  → 这些就是互相抢核的元凶：blq kill-strays --yes")
+    live = cpu_busy()
+    mode = f"固定并发 {FIXED_SLOTS}" if FIXED_SLOTS is not None else f"动态并发 1–{MAX_SLOTS}"
+    cpu_txt = f" · 整机 CPU {live * 100:.0f}%" if live is not None else ""
+    print(f"并发：{mode} · 运行 {len(data['running'])} 件{cpu_txt}")
     print(f"Blender 进程总数：{data['blender_total']}")
     print(f"状态页：{_url()}  （打开：blq open）")
     return 0
@@ -453,19 +649,29 @@ def cmd_doctor() -> int:
     except Exception:
         pass
     cpu_sum = sum(p["pcpu"] for p in procs) / 100
+    limit = FIXED_SLOTS if FIXED_SLOTS is not None else MAX_SLOTS
+    mode = (
+        f"固定 {FIXED_SLOTS}"
+        if FIXED_SLOTS is not None
+        else f"动态 1–{MAX_SLOTS}（CPU 目标 {CPU_TARGET * 100:.0f}%）"
+    )
+    live = cpu_busy()
     verdict = []
-    if len(headless) > int(os.environ.get("BLQ_SLOTS", DEFAULT_SLOTS)):
-        verdict.append(f"headless 并发 {len(headless)} > 闸门上限 —— 有人绕过 blq")
+    if len(headless) > limit:
+        verdict.append(f"headless 并发 {len(headless)} > 闸门上限 {limit} —— 有人绕过 blq")
     if cpu_sum > cores * 1.2:
         verdict.append(f"Blender 合计吃 {cpu_sum:.1f} 核 / 共 {cores} 核 —— 已经超订")
-    if swap_used_gb > 4:
-        verdict.append(f"swap 已用 {swap_used_gb:.1f}G —— 内存被挤爆，渲染会成倍变慢")
+    if swap_used_gb > MAX_SWAP_GB:
+        verdict.append(
+            f"swap 已用 {swap_used_gb:.1f}G > {MAX_SWAP_GB:.1f}G —— 动态并发不会再扩"
+        )
     if load1 > cores * 2:
         verdict.append(f"load {load1:.0f} / {cores} 核 —— 调度器已经排队")
     print(f"Blender 进程 {len(procs)}（headless {len(headless)}）· 合计 {cpu_sum:.1f} 核 / {cores} 核")
     print(f"load1 {load1:.1f} · swap 已用 {swap_used_gb:.1f}G")
+    print(f"并发：{mode}" + (f" · 整机 CPU {live * 100:.0f}%" if live is not None else ""))
     if verdict:
-        print("\n结论：不许再加作业，先让队列跑。")
+        print("\n结论：先把并发收回来 —— 上面这些会让动态闸门停止扩槽。")
         for v in verdict:
             print(f"  ⚠ {v}")
         return 1
@@ -559,8 +765,12 @@ _LIVE_JS = r"""
     }
     board.appendChild(table);
     var stamp = document.getElementById('stamp');
-    if (stamp) stamp.textContent = d.generated.replace('T', ' ') +
-      ' · 并发上限 ' + d.slots + ' · headless 进程 ' + d.headless + ' 个';
+    if (stamp) {
+      var modeTxt = d.mode === 'fixed' ? ('固定并发 ' + d.slots) : ('动态并发 1–' + d.max_slots);
+      stamp.textContent = d.generated.replace('T', ' ') + ' · ' + modeTxt +
+        ' · headless 进程 ' + d.headless + ' 个' +
+        (d.cpu != null ? ' · CPU ' + d.cpu + '%' : '');
+    }
     active = (d.running || []).length + (d.waiting || []).length > 0;
   }
 
@@ -654,6 +864,12 @@ def _html(d: dict, live: bool = True) -> str:
         if live
         else ""
     )
+    mode_txt = (
+        f"固定并发 {FIXED_SLOTS}"
+        if FIXED_SLOTS is not None
+        else f"动态并发 1–{MAX_SLOTS}"
+    )
+    cpu_txt = f" · CPU {d['cpu']}%" if d.get("cpu") is not None else ""
     html = f"""<!doctype html><meta charset="utf-8">
 <title>Blender 闸门状态</title>
 <style>
@@ -673,7 +889,7 @@ border-radius:7px;background:#fff;color:#4a413a;cursor:pointer}}
 button:hover{{background:#faf8f5}}
 #mode{{margin:0}}</style>
 <h1>Blender 闸门</h1>
-<div class=sub id=stamp>{d['generated'].replace('T', ' ')} · 并发上限 {DEFAULT_SLOTS} · headless 进程 {d['headless']} 个</div>
+<div class=sub id=stamp>{d['generated'].replace('T', ' ')} · {mode_txt} · headless 进程 {d['headless']} 个{cpu_txt}</div>
 <div id=board>{banner}
 <table><tr><th>槽位</th><th>作业</th><th>已跑</th><th>状态</th></tr>{rows}</table></div>
 {footer}
@@ -916,7 +1132,12 @@ def _esc(s: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="blq", description="全机 Blender 串行闸门（Cevtuo-Blendergate）")
     ap.add_argument("--version", action="version", version=f"blq {__version__}")
-    ap.add_argument("--slots", type=int, default=DEFAULT_SLOTS, help=f"并发上限（默认 {DEFAULT_SLOTS}）")
+    ap.add_argument(
+        "--slots",
+        type=int,
+        default=FIXED_SLOTS,
+        help=f"固定并发上限；不填则按 CPU 动态（上限 {MAX_SLOTS}）",
+    )
     sub = ap.add_subparsers(dest="cmd")
 
     p_run = sub.add_parser("run", help="在闸门里跑任意命令行")
